@@ -1,0 +1,265 @@
+---
+title: "<center>Modelowanie rynków finansowych - własności danych śróddziennych</center>"
+output: 
+    html_document:
+          code_folding: hide
+          toc: true
+          toc_float: true
+          number_sections: true
+          css: style.css
+---
+
+<center>
+Karol Doliński
+
+Informatyka i Ekonometria
+</center>
+
+```{r setup, include=FALSE}
+#options(scipen=999)
+knitr::opts_chunk$set(
+ fig.width = 6,
+ fig.asp = 0.9,
+ out.width = "100%"
+)
+```
+
+-----
+
+# Wprowadzenie
+
+Tematem niniejszego projektu jest zbadanie własności danych śróddziennych. Zwrócona zostanie uwaga na intensywność obrotu akcjami wybranych spółek giełdowych na przestrzeni sesji giełdowej oraz sprawdzone zostanie występowanie śróddziennej sezonowości zmienności wraz z ewentualnym zaproponowaniem stosunkowo prostej metody do usuwania tego zjawiska. 
+
+Wykorzystane w pracy dane zostały pobrane w dniu 15.10.2022 roku ze strony [Stooq](https://stooq.pl/) i dotyczą okresu od 26 sierpnia 2022 roku do 14 października 2022 roku. Zbiór danych dotyczy wartości zamknięcia dla dwóch spółek z indeksu WIG20: PGE i PGN (dane pięciominutowe). Dane 5-minutowe przedstawiają wartości zamknięcia od godziny 09:00 do 16:45. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE}
+library(ggplot2)
+library(forecast)
+library(lubridate)
+library(stringr)
+library(tidyverse)
+library(zoo)
+
+pge <- read.csv("pge.txt")
+pgn <- read.csv("pgn.txt")
+```
+
+W przypadku danych 5-minutowych możliwe są sytuacje, iż w jednym okresie 5-minutowym nie dojdzie do handlu papierami wartościowymi. W takim wypadku liczba wolumenów w zbiorze danych dla danego okresu jest równa 0, a wartości zamknięcia nie podaje się. W takich przypadkach zdecydowano się uzupełnić brakujące wartości pierwszymi je poprzedzającymi, które są niepuste. 
+
+Stopa zwrotu jest wskaźnikiem finansowym, miarą ryzyka danego przedsięwzięcia czy inwestycji. Na podstawie danych  obliczono logarytmiczne stopy zwrotu:
+
+$$R_{t} = ln(\frac{C_t}{C_{t-1}}),$$
+
+gdzie:
+
+$C_{t}$ – cena zamknięcia $t$
+
+$C_{t-1}$ – cena zamknięcia $t-1$
+
+$t$ - jedna jednostka czasu, tj. dzień i godzina ze zbioru {2022-08-26 09:00, 2022-08-26 09:05, ..., 2022-10-14 16:45}
+
+Przed przystąpieniem do dalszej analizy zdecydowano się usunąć z uzyskanego szeregu czasowego stopy zwrotu _overnight_, czyli takie obliczone jako różnica logarytmu wartości zamknięcia z godziny 16:45 z dnia $i-1$ i logarytmu wartości zamknięcia z godziny 09:00 z dnia $i$ (uwzględniając tylko dni otwarcia giełdy). 
+
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+data_preprocessing <- function(x){
+  x <- as_tibble(x[c("X.DATE.", "X.TIME.", "X.CLOSE.", "X.VOL.")])
+  colnames(x) <- c("Date", "Time", "Close", "Volumen")
+  x$Time <- str_pad(x$Time, 6, pad="0", side = "left")
+  x <- x %>% mutate(DateTime = paste(Date, Time, sep = " "))
+  x$DateTime <- ymd_hms(x$DateTime)
+  x$Date <- ymd(x$Date)
+  
+  date_min <- paste0(as.character(min(x$Date)), " 09:00:00")
+  date_max <- paste0(as.character(max(x$Date)), " 17:00:00")
+  rates <- as_tibble(seq(ymd_hms(date_min), ymd_hms(date_max), by = 5*60))
+  rates <- rates %>% filter(wday(value, week_start = getOption("lubridate.week.start", 1)) %in% c(1:5))
+  rates <- rates %>% filter((hour(rates$value) * 60 + minute(rates$value) >= 9*60) & (hour(rates$value) * 60 + minute(rates$value) <= 16*60+45))
+  colnames(rates) <- c("DateTime")
+  
+  rates <- left_join(rates, x, by = "DateTime")
+  rates$Date <- as_date(rates$DateTime)
+  rates$Time <- str_sub(as.character(rates$DateTime), -8, -1)
+  rates$Close <- na.locf(rates$Close)
+  rates$Volumen <- replace_na(rates$Volumen, 0)
+  rates["Rate"] <- log(rates$Close / lag(rates$Close))
+  rates$Time <- str_sub(as.character(rates$DateTime), -8, -4)
+  
+  return(rates)
+}
+
+rates_pge <- data_preprocessing(pge) %>% filter(hour(DateTime) * 60 + minute(DateTime) != 9*60)
+rates_pgn <- data_preprocessing(pgn) %>% filter(hour(DateTime) * 60 + minute(DateTime) != 9*60)
+```
+
+-----
+
+# Intensywność obrotu akcjami
+
+Wykres przekrojowych średnich stóp zwrotu pozwala zauważyć, że zaraz po otwarciu sesji giełdowej obie wybrane spółki notują spadek (pierwsza stopa zwrotu jest ujemna). Niedługo potem stopa zwrotu (dla godz. 09:10) jest najwyższa dla całej sesji, co świadczy o znaczącym zwiększeniu się ceny akcji pomiędzy godziną 09:05 a 09:10. Do około godziny 13:00 widoczne są wahania stóp zwrotu od -0,0012 do 0,0012. Między godziną 13:00 a 14:00 wahania są niższe, by po godzinie 14:00 stały się bardziej dynamiczne. Należy podkreślić, iż o godzinie 14:00 otwierana jest amerykańska giełda, co może nie być bez znaczenia dla notowań na polskiej GPW. Ostatnie stopy zwrotu dla PGE i PGN są ujemne i przyjmują jedne z najniższych wartości spośród wszystkich stóp zwrotu. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, out.width="70%", fig.align='center'}
+mean_rates_pge <- rates_pge %>% 
+  group_by(Time) %>%  
+  summarize(Mean = mean(Rate))
+mean_rates_pge["name"] <- 'PGE'
+
+mean_rates_pgn <- rates_pgn %>% 
+  group_by(Time) %>%  
+  summarize(Mean = mean(Rate))
+mean_rates_pgn["name"] <- 'PGN'
+
+mean_rates <- rbind(mean_rates_pge, mean_rates_pgn)
+
+mean_rates %>%
+  ggplot(aes(x = Time, y = Mean, group = name, color = name)) +
+  geom_line() + 
+  ggtitle("Przekrojowe średnie stopy zwrotu") + 
+  xlab("Godzina") + 
+  ylab("Średnia stopa zwrotu") + 
+  labs(color="Spółka") +
+  geom_hline(yintercept=0, linetype="solid", color = "black", alpha=0.5) +
+  scale_x_discrete(breaks = c('09:05', '11:00', '13:00', '15:00', '16:45')) + 
+  theme_bw() + 
+  theme(legend.position = "none") +
+  facet_grid(factor(name)~.)
+```
+
+Wyznaczając średni zlogarytmowany wolumen obrou zdecydowano się dodać do każdej obserwacji po 1 jednostce. Nie wpłynie to w żaden istotny sposób na wynik i wyciągnięte wnioski, a pozwoli uniknąć sytuacji kiedy takiej średniej nie można byłoby wyznaczyć (gdyby w jakimkolwiek okresie 5-minutowym nie było żadnej transakcji, wówczas liczba wolumenów byłaby równa 0, a $ln(0) = -\infty$). Zlogarytmowanie ma na celu zmniejszenie wpływu obserwacji odstających. 
+
+Średni wolumen obrotu dla obu badanych spółek znajduje się przez większość czasu trwania sesji na stałym poziomie. Największy wzrost wolumenu obrotu następuje pod koniec notowań danego dnia – co jest raczej zjawiskiem zauważalnym dla zdecydowanej większości spółek akcyjnych. Większa liczba wolumenów jest przedmiotem handlu również na początku sesji giełdowej, chociaż dla spółek PGE i PGN nie są to drastycznie różne wartości średniego wolumenu obrotu w porównaniu do handlu w ciągu całego dnia.  
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, out.width="70%", fig.align='center'}
+mean_volumen_pge <- data_preprocessing(pge) %>% 
+  group_by(Time) %>%  
+  summarize(Mean = mean(log(Volumen+1)))
+mean_volumen_pge["name"] <- 'PGE'
+
+mean_volumen_pgn <- data_preprocessing(pgn) %>% 
+  group_by(Time) %>%  
+  summarize(Mean = mean(log(Volumen+1)))
+mean_volumen_pgn["name"] <- 'PGN'
+
+mean_volumen <- rbind(mean_volumen_pge, mean_volumen_pgn)
+
+mean_volumen %>%
+  ggplot(aes(x = Time, y = Mean, group = name, color = name)) +
+  geom_line() + 
+  ggtitle("Średnie zlogarytmowane wolumeny obrotu") + 
+  xlab("Godzina") + 
+  ylab("Logarytm wolumenu obrotu") + 
+  labs(color="Spółka") +
+  geom_hline(yintercept=0, linetype="solid", color = "black", alpha=0.5) +
+  scale_x_discrete(breaks = c('09:00', '11:00', '13:00', '15:00', '16:45')) + 
+  theme_bw() + 
+  theme(legend.position = "none") +
+  facet_grid(factor(name)~.)
+```
+
+-----
+
+# Sezonowość zmienności
+
+Następnym etapem pracy było zbadanie, czy w analizowanym okresie 5-minutowe stopy zwrotu akcji spółek PGE i PGN charakteryzowały się sezonową zmiennością. Jako przyczyny występowania śróddziennej sezonowości zmienności można wymienić: 
+
+* harmonogram sesji,
+* wpływ otwarcia i/lub zamknięcia innych rynków,
+* publikacje istotnych z punktu widzenia rynku lub danej spółki informacji.
+
+Skutkiem występowania śróddziennej sezonowości zmienności jest między innymi zniekształcona autokorelacja. 
+
+Wykresy średnich z wartości bezwzględnych stóp zwrotu obu analizowanych spółek wskazują, iż największa zmienność występuje w pierwszej i ostatniej godzinie sesji. Najmniejsza, rzędu 0,002, występuje w godzinach od 11:00 do 14:00. Na tej podstawie można wnioskować o występowaniu dziennej sezonowości zmienności. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE, out.width="70%", fig.align='center'}
+mean_rates_abs_pge <- rates_pge %>% 
+  group_by(Time) %>%  
+  summarize(Mean = mean(abs(Rate)))
+mean_rates_abs_pge["name"] <- 'PGE'
+
+mean_rates_abs_pgn <- rates_pgn %>% 
+  group_by(Time) %>%  
+  summarize(Mean = mean(abs(Rate)))
+mean_rates_abs_pgn["name"] <- 'PGN'
+
+mean_rates_abs <- rbind(mean_rates_abs_pge, mean_rates_abs_pgn)
+
+mean_rates_abs %>%
+  ggplot(aes(x = Time, y = Mean, group = name, color = name)) +
+  geom_line() + 
+  ggtitle("Średnie z wartości bezwzględnych stóp zwrotu") + 
+  xlab("Godzina") + 
+  ylab("Średnia z wartości bezwzględnych stóp zwrotu") + 
+  labs(color="Spółka") +
+  geom_hline(yintercept=0, linetype="solid", color = "black", alpha=0.5) +
+  scale_x_discrete(breaks = c('09:05', '11:00', '13:00', '15:00', '16:45')) + 
+  theme_bw() + 
+  theme(legend.position = "none") +
+  facet_grid(factor(name)~.)
+
+```
+
+Następnie zbadano autokorelację wartości bezwzględnych stóp zwrotu. Na początku warto zauważyć, iż jeden dzień sesji to 93 okresy 5-minutowe (od 9:00 do 16:45). Widać pewną powtarzalność co taki okres. Najwyższe piki są dla początkowych opóźnień, następnie dla opóźnienia w okolicach 93 okresu i jego wielokrotności. Właściwie można mówić o następującym zjawisku, iż wartość funkcji ACF osiąga najwyższe wartości dla początkowych opóźnień, następne te wartości spadają by z powrotem wzrosnąć i osiągnąć szczyt w okolicach 93 opóźnienia. Zjawisko to się powtarza, z tym, że dla spółki PGE wydaje się ono bardziej wygaszać z upływem opóźnień. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, out.width="50%"}
+rates_pge %>% 
+  select(Rate) %>% 
+  abs() %>% 
+  ggAcf(., lag.max = 500) +
+  ggtitle('Autokorelacja wartości bezwzględnych stóp zwrotu - PGE') +
+  xlab('Opóźnienie') +
+  theme_bw()
+
+rates_pgn %>% 
+  select(Rate) %>% 
+  abs() %>% 
+  ggAcf(., lag.max = 500) +
+  ggtitle('Autokorelacja wartości bezwzględnych stóp zwrotu - PGN') +
+  xlab('Opóźnienie') +
+  theme_bw()
+```
+
+-----
+
+# Usuwanie sezonowości
+
+Usuwanie zmienności śróddziennej sezonowości może być dokonane relatywnie prostą metodą. Założywszy stałość zmienności dziennej należy podzielić poszczególne stopy zwrotu przez odpowiadające im przekrojowe średnie z wartości bezwzględnych. Innymi słowy każdą 5-minutową stopę zwrotu przyporządkowaną do danej godziny należy podzielić przez średnią z wartości bezwzględnych wszystkich 5-minutowych wartości stóp zwrotu przyporządkowanych do tej godziny. 
+
+```{r echo=TRUE, message=FALSE, warning=FALSE}
+rates_pge_new <- left_join(rates_pge, mean_rates_abs_pge, by = "Time") %>% 
+  select("Date", "Time", "Rate", "Mean")
+rates_pge_new$Rate <- rates_pge_new$Rate / rates_pge_new$Mean
+
+rates_pgn_new <- left_join(rates_pgn, mean_rates_abs_pgn, by = "Time") %>% 
+  select("Date", "Time", "Rate", "Mean")
+rates_pgn_new$Rate <- rates_pgn_new$Rate / rates_pgn_new$Mean
+```
+
+Po zastosowaniu tej metody ponownie zbadano autokorelacje wartości bezwzględnych tak zmodyfikowanych stóp zwrotu. Sezonowość przestała być widoczna, a wahania wartości współczynnika autokorelacji zmniejszyły się. Można stwierdzić, iż zaproponowana metoda okazała się skuteczna w usuwaniu sezonowości w zmienności. 
+
+```{r echo=FALSE, message=FALSE, warning=FALSE, out.width="50%"}
+rates_pge_new %>% 
+  select(Rate) %>% 
+  abs() %>% 
+  ggAcf(., lag.max = 500) +
+  ggtitle('Autokorelacja wartości bezwzględnych stóp zwrotu - PGE') +
+  xlab('Opóźnienie') +
+  theme_bw()
+
+rates_pgn_new %>% 
+  select(Rate) %>% 
+  abs() %>% 
+  ggAcf(., lag.max = 500) +
+  ggtitle('Autokorelacja wartości bezwzględnych stóp zwrotu - PGN') +
+  xlab('Opóźnienie') +
+  theme_bw()
+```
+
+-----
+
+# Podsumowanie
+
+W pracy zbadano intensywność obrotu akcjami wybranych spółek giełdowych, tj. PGE i PGN na przestrzeni sesji giełdowej. Zarówno analiza przekrojowych średnich stóp zwrotu jak i średniego zlogarytmowanego wolumenu pozwala stwierdzić, iż największa intensywność obrotu akcjami występuje na początku i na końcu sesji giełdowej. Okres od godziny 11:00 do 14:00 można określić jako najbardziej spokojny, gdzie transakcje opiewają na mniejsze wartości liczby wolumenów. 
+
+Następnie dla wykrytej śróddziennej sezonowości zmienności zaproponowano stosunkowo prostą metodę do jej usunięcia. Sama śróddzienną sezonowość była bardzo zauważalna podczas analizy przekrojowych średnich z wartości bezwzględnych 5-minutowych stóp zwrotu oraz ich autokorelacji. Najwyższe wartości ACF były odnotowane dla początkowych opóźnień, następnie dla opóźnień w okolicach 93 okresu i wielokrotności 93 okresu. Świadczy to o występowaniu śróddziennej sezonowości danych. Wspomnianą sezonowość udało się usunąć wykorzystując relatywnie prostą metodę polegającą na tym, iż podzielono poszczególne stopy zwrotu przez odpowiadające im przekrojowe średnie z wartości bezwzględnych.
+
+
